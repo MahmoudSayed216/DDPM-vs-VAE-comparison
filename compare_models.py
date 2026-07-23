@@ -1,448 +1,551 @@
 """
-DDPM vs. VAE: CIFAR-10 model comparison.
+compare_models.py
+==================
 
-Loads a trained conditional DDPM checkpoint and a trained conditional VAE checkpoint,
-and compares them on:
+Compares the trained Conditional DDPM and Conditional VAE on CIFAR-10:
 
-1. Overall FID / Inception Score (mixed classes, N generated samples per model)
-2. Per-class FID / Inception Score, plotted side by side
-3. A qualitative check: 10 random DDPM-generated images vs. their 5 nearest real
-   CIFAR-10 images (pixel-space L2 distance), to eyeball whether the model is
-   generating something new or effectively memorizing training images
+  1. Loads both model checkpoints.
+  2. Generates N samples from each model, N/10 per class.
+  3. Computes overall FID + Inception Score, and per-class FID + IS, for both models.
+  4. Plots the comparisons (saved as PNGs, and shown inline if run in a notebook cell).
+  5. For the DDPM, takes one generated image per class (10 total) and finds the
+     top-5 most similar real CIFAR-10 images (Inception-feature cosine similarity).
+  6. Prints a brief text conclusion comparing the two models.
 
-Both models are rebuilt using the architecture config saved *inside their own
-checkpoint* (checkpoint["config"]), not whatever happens to be in configs.yml on
-disk right now -- so this works regardless of what configs.yml has been edited
-to since training, and can't hit a shape-mismatch error from an architecture/
-checkpoint mismatch.
+Assumed repo layout (override any of these with CLI flags if yours differs):
 
-All graphs are saved as PNG files under OUTPUT_DIR (see CONFIG below) so they're
-visible whether this runs in an interactive session or headless (e.g. a Kaggle
-script run, a plain `python compare_models.py`).
+    <repo_root>/
+        ddpm/
+            cifar10_dataset.py
+            ConditionalDDPM.py
+            diffusion_utils.py
+            configs.yml
+            checkpoints/ddpm_epoch_XXX.pt
+        vae/
+            cifar10_dataset.py
+            ConditionalVAE.py
+            configs.yml
+            checkpoints/vae_epoch_XXX.pt
+        compare_models.py   <- this file
+
+Usage (from the repo root, e.g. in a Kaggle notebook cell):
+
+    !python compare_models.py
+
+Or, to see the figures rendered inline in the notebook (instead of only saved
+to disk), run it as a magic command instead of a shell call:
+
+    %run compare_models.py
+
+All settings live in the CONFIG block right below the imports -- edit those
+values directly instead of passing CLI flags.
 """
 
+import importlib.util
 import os
-import random
+import sys
+import time
 
 import numpy as np
-import pandas as pd
 import torch
-from torch.utils.data import DataLoader, Subset
-import matplotlib
+import torch.nn.functional as F
+import yaml
 import matplotlib.pyplot as plt
-
-from cifar10_dataset import CIFAR10Dataset, denormalize
-from ConditionalDDPM import ConditionalDDPM
-from diffusion_utils import GaussianDiffusion
-from ConditionalVAE import ConditionalVAE
-from metrics import compute_fid_and_is
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
+from torch.utils.data import DataLoader
 
 CIFAR10_CLASS_NAMES = [
     "airplane", "automobile", "bird", "cat", "deer",
     "dog", "frog", "horse", "ship", "truck",
 ]
+NUM_CLASSES = 10
 
 
-# ============================================================
-# CONFIG -- edit these to match your setup
-# ============================================================
-DDPM_CHECKPOINT_PATH = "/kaggle/input/models/marwansayed2000/ddpm70i/pytorch/default/1/ddpm.pt"
-VAE_CHECKPOINT_PATH = "/kaggle/input/models/marwansayed2000/vae70i/pytorch/default/1/vae.pt"
-DATA_DIR = "/kaggle/input/datasets/pankrzysiu/cifar10-python"
-DOWNLOAD_DATA = False  # True if DATA_DIR doesn't already contain cifar-10-batches-py
+# ====================================================================
+# CONFIG -- edit these directly instead of passing command-line flags.
+# ====================================================================
 
-OUTPUT_DIR = "./comparison_outputs"  # where PNG graphs get saved
+# Directories containing each project's files (dataset/model code, configs.yml,
+# checkpoints/). Assumed layout: <repo_root>/ddpm/ and <repo_root>/vae/, with
+# this script sitting at <repo_root>/compare_models.py.
+DDPM_DIR = "ddpm"
+VAE_DIR = "vae"
 
-# ---- Evaluation settings ----
-# FID is a biased estimator whose bias shrinks as sample count grows -- estimates
-# from only a couple hundred samples are noisy and not directly comparable to
-# numbers reported in papers (which typically use 10k-50k samples). These default
-# to modest values so the script runs in a reasonable time; raise them for more
-# trustworthy numbers if you can afford the extra generation time (DDPM sampling
-# in particular is slow -- it runs the full reverse diffusion loop per batch).
-N_SAMPLES_OVERALL = 2000      # total generated samples per model for the overall FID/IS estimate
-N_SAMPLES_PER_CLASS = 200     # generated samples per class for the per-class FID/IS breakdown
-FID_IS_BATCH_SIZE = 100       # generation batch size used internally by compute_fid_and_is
+# Path to each configs.yml. Set to None to default to "<DDPM_DIR>/configs.yml"
+# and "<VAE_DIR>/configs.yml".
+DDPM_CONFIG_PATH = "ddpm_configs.yml"
+VAE_CONFIG_PATH = "vae_configs.yml"
 
-# ---- Nearest-neighbor settings ----
-NUM_GENERATED_FOR_NN = 10     # how many DDPM images to generate for the similarity search
-NUM_NEIGHBORS = 5             # how many nearest real images to retrieve per generated image
+# Path to a specific checkpoint file. Set to None to auto-pick the
+# highest-epoch "ddpm_epoch_*.pt" / "vae_epoch_*.pt" checkpoint found in each
+# model's configured CHECKPOINT_DIR.
+DDPM_CKPT_PATH = "/kaggle/input/models/marwansayed2000/ddpm70i/pytorch/default/1/ddpm.pt"
+VAE_CKPT_PATH = "/kaggle/input/models/marwansayed2000/vae70i/pytorch/default/1/vae.pt"
 
-SEED = 42
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Root dir for the real CIFAR-10 data used as the FID/IS reference and the
+# nearest-neighbor pool. Set to None to default to DATA.DATA_DIR from
+# DDPM_CONFIG_PATH.
+REAL_DATA_DIR = "/kaggle/input/datasets/pankrzysiu/cifar10-python"
+
+# Whether to allow downloading CIFAR-10 if it isn't found locally (leave
+# False on a read-only Kaggle input mount).
+DOWNLOAD = False
+
+# Total number of samples to generate PER MODEL (rounded down to a multiple
+# of 10 so every class gets an equal share). Raise this for tighter FID/IS
+# estimates if you have the compute budget.
+N_SAMPLES = 500
+
+# Batch size used during sample generation (mainly matters for the DDPM,
+# since each batch runs the full reverse-diffusion loop).
+GEN_BATCH_SIZE = 64
+
+# Cap on real test images used per class as the FID/IS reference (the test
+# split only has ~1000/class, so this rarely needs to change).
+MAX_REAL_PER_CLASS = 500
+
+# How many real train-split images per class to search over for the
+# nearest-neighbor step.
+NN_POOL_PER_CLASS = 1000
+
+# Where to save the output PNG figures.
+OUTPUT_DIR = "comparison_outputs"
+
+# Random seed, for reproducible sample generation.
+SEED = 46
+
+# "cuda", "cpu", or None to auto-detect (cuda if available, else cpu).
+DEVICE = "cuda"
 
 
-# ============================================================
-# Data loading
-# ============================================================
-def indices_by_class(dataset, num_classes):
-    """torchvision CIFAR10 stores plain python-int labels in .targets."""
-    targets = dataset.base_dataset.targets
-    buckets = {c: [] for c in range(num_classes)}
-    for idx, label in enumerate(targets):
-        buckets[label].append(idx)
-    return buckets
+# ------------------------------------------------------------------
+# Dynamic module loading (so we can import ddpm/ and vae/ code, which
+# both define modules with the same names, without them clobbering
+# each other in sys.modules).
+# ------------------------------------------------------------------
 
-
-def load_data():
-    train_dataset = CIFAR10Dataset(root=DATA_DIR, train=True, augment=False, download=DOWNLOAD_DATA)
-    test_dataset = CIFAR10Dataset(root=DATA_DIR, train=False, augment=False, download=DOWNLOAD_DATA)
-
-    num_classes = 10
-    train_indices_by_class = indices_by_class(train_dataset, num_classes)
-    test_indices_by_class = indices_by_class(test_dataset, num_classes)
-
-    print(f"Train set: {len(train_dataset)} images | Test set: {len(test_dataset)} images")
-    for c in range(num_classes):
-        print(
-            f"  class {c} ({CIFAR10_CLASS_NAMES[c]}): "
-            f"{len(train_indices_by_class[c])} train / {len(test_indices_by_class[c])} test"
+def _load_module(unique_name, file_path):
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(
+            f"Expected to find '{file_path}' but it doesn't exist. "
+            f"Pass the correct directory via the CLI flags (see --help)."
         )
-
-    return train_dataset, test_dataset, train_indices_by_class, test_indices_by_class, num_classes
-
-
-# ============================================================
-# Model loading
-# ============================================================
-def load_ddpm():
-    checkpoint = torch.load(DDPM_CHECKPOINT_PATH, map_location=DEVICE)
-    cfg = checkpoint["config"]
-    model_cfg = cfg["MODEL"]
-
-    model = ConditionalDDPM(
-        num_classes=model_cfg["NUM_CLASSES"],
-        embedding_dim=model_cfg["CLASS_EMBEDDING_DIM"],
-        num_groups=model_cfg["NUM_GROUPS"],
-        channels_per_level=model_cfg["CHANNELS_PER_LEVEL"],
-        theta=model_cfg["THETA"],
-    ).to(DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    diffusion = GaussianDiffusion(
-        timesteps=cfg["DIFFUSION"]["TIMESTEPS"],
-        beta_start=cfg["DIFFUSION"]["BETA_START"],
-        beta_end=cfg["DIFFUSION"]["BETA_END"],
-        schedule=cfg["DIFFUSION"]["BETA_SCHEDULE"],
-        device=DEVICE,
-    )
-
-    image_size = model_cfg["IMAGE_SIDE_LENGTH"]
-    print(f"Loaded DDPM checkpoint from epoch {checkpoint['epoch']} | image size {image_size}x{image_size}")
-    return model, diffusion, image_size
+    spec = importlib.util.spec_from_file_location(unique_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[unique_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-def load_vae(expected_image_size):
-    checkpoint = torch.load(VAE_CHECKPOINT_PATH, map_location=DEVICE)
-    cfg = checkpoint["config"]
-    model_cfg = cfg["MODEL"]
-
-    model = ConditionalVAE(
-        num_classes=model_cfg["NUM_CLASSES"],
-        embedding_dim=model_cfg["CLASS_EMBEDDING_DIM"],
-        num_groups=model_cfg["NUM_GROUPS"],
-        channels_per_level=model_cfg["CHANNELS_PER_LEVEL"],
-        latent_channels=model_cfg["LATENT_CHANNELS"],
-    ).to(DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    latent_channels = model_cfg["LATENT_CHANNELS"]
-    latent_spatial = model_cfg["IMAGE_SIDE_LENGTH"] // 8
-
-    print(
-        f"Loaded VAE checkpoint from epoch {checkpoint['epoch']} | "
-        f"latent shape ({latent_channels}, {latent_spatial}, {latent_spatial})"
-    )
-
-    if model_cfg["IMAGE_SIDE_LENGTH"] != expected_image_size:
-        print(
-            f"WARNING: DDPM image size ({expected_image_size}) and VAE image size "
-            f"({model_cfg['IMAGE_SIDE_LENGTH']}) differ -- comparisons below assume matching sizes."
-        )
-
-    return model, latent_channels, latent_spatial
+def _resolve_relative(base_dir, maybe_relative_path):
+    """configs.yml paths (e.g. CHECKPOINT_DIR: './checkpoints') are relative to
+    wherever the original training script was run from. We treat them as
+    relative to the model's own directory (base_dir) unless already absolute."""
+    if os.path.isabs(maybe_relative_path):
+        return maybe_relative_path
+    return os.path.normpath(os.path.join(base_dir, maybe_relative_path))
 
 
-# ============================================================
-# Sampling functions
-#
-# Both wrapped to the same interface -- (batch_size, class_ids=None) -> (B, 3, H, W)
-# tensor in [-1, 1] -- so the FID/IS code doesn't need to know which model it's
-# talking to.
-# ============================================================
-def make_ddpm_sample_fn(model, diffusion, image_size, num_classes):
+def _find_latest_checkpoint(checkpoint_dir, prefix):
+    if not os.path.isdir(checkpoint_dir):
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    def epoch_num(fname):
+        try:
+            return int(fname[len(prefix):-len(".pt")])
+        except ValueError:
+            return -1
+
+    ckpts = [f for f in os.listdir(checkpoint_dir) if f.startswith(prefix) and f.endswith(".pt")]
+    if not ckpts:
+        raise FileNotFoundError(f"No checkpoints matching '{prefix}*.pt' found in {checkpoint_dir}")
+    ckpts.sort(key=epoch_num)
+    return os.path.join(checkpoint_dir, ckpts[-1])
+
+
+# ------------------------------------------------------------------
+# FID / IS helpers
+# ------------------------------------------------------------------
+
+def _to_uint8(images):
+    images = (images.clamp(-1, 1) + 1.0) / 2.0
+    return (images * 255).to(torch.uint8)
+
+
+@torch.no_grad()
+def compute_fid_and_is(real_imgs, fake_imgs, device, batch_size=200):
+    """real_imgs, fake_imgs: (N, 3, H, W) tensors in [-1, 1] on CPU."""
+    fid = FrechetInceptionDistance(normalize=False).to(device)
+    inc = InceptionScore(normalize=False).to(device)
+
+    for i in range(0, real_imgs.shape[0], batch_size):
+        batch = real_imgs[i:i + batch_size].to(device)
+        fid.update(_to_uint8(batch), real=True)
+
+    for i in range(0, fake_imgs.shape[0], batch_size):
+        batch = fake_imgs[i:i + batch_size].to(device)
+        u8 = _to_uint8(batch)
+        fid.update(u8, real=False)
+        inc.update(u8)
+
+    fid_value = fid.compute().item()
+    is_mean, is_std = inc.compute()
+    del fid, inc
+    return fid_value, is_mean.item(), is_std.item()
+
+
+# ------------------------------------------------------------------
+# Inception-feature embeddings, used only for the nearest-neighbor
+# similarity lookup (kept separate from the FID/IS metrics above).
+# ------------------------------------------------------------------
+
+class InceptionEmbedder:
+    def __init__(self, device):
+        from torchvision.models import inception_v3
+        try:
+            from torchvision.models import Inception_V3_Weights
+            net = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, aux_logits=True)
+        except ImportError:
+            net = inception_v3(pretrained=True, aux_logits=True)
+        net.fc = torch.nn.Identity()
+        net.eval().to(device)
+        self.net = net
+        self.device = device
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
     @torch.no_grad()
-    def ddpm_sample(batch_size, class_ids=None):
-        if class_ids is None:
-            class_ids = torch.randint(0, num_classes, (batch_size,), device=DEVICE)
-        elif not torch.is_tensor(class_ids):
-            class_ids = torch.as_tensor(class_ids, device=DEVICE, dtype=torch.long)
-        samples = diffusion.p_sample_loop(model, (batch_size, 3, image_size, image_size), class_ids, DEVICE)
-        return samples.clamp(-1.0, 1.0)
-
-    return ddpm_sample
-
-
-def make_vae_sample_fn(model, latent_channels, latent_spatial, num_classes):
-    @torch.no_grad()
-    def vae_sample(batch_size, class_ids=None):
-        if class_ids is None:
-            class_ids = torch.randint(0, num_classes, (batch_size,), device=DEVICE)
-        elif not torch.is_tensor(class_ids):
-            class_ids = torch.as_tensor(class_ids, device=DEVICE, dtype=torch.long)
-        z = torch.randn(batch_size, latent_channels, latent_spatial, latent_spatial, device=DEVICE)
-        samples = model.decode(z, class_ids)
-        return samples.clamp(-1.0, 1.0)
-
-    return vae_sample
+    def embed(self, images_neg1_to_1, batch_size=128):
+        """images_neg1_to_1: (N, 3, 32, 32) tensor in [-1, 1] on CPU. Returns (N, 2048) CPU tensor."""
+        feats = []
+        for i in range(0, images_neg1_to_1.shape[0], batch_size):
+            batch = images_neg1_to_1[i:i + batch_size].to(self.device)
+            batch = (batch.clamp(-1, 1) + 1.0) / 2.0  # -> [0, 1]
+            batch = F.interpolate(batch, size=(299, 299), mode="bilinear", align_corners=False)
+            batch = (batch - self.mean) / self.std
+            out = self.net(batch)
+            feats.append(out.cpu())
+        return torch.cat(feats, dim=0)
 
 
-def make_class_conditional_sample_fn(sample_fn, class_id):
-    """Wraps a (batch_size, class_ids=None)->images sampler into a plain
-    (batch_size)->images closure fixed to one class, for compute_fid_and_is."""
-    def _fn(batch_size):
-        class_ids = torch.full((batch_size,), class_id, device=DEVICE, dtype=torch.long)
-        return sample_fn(batch_size, class_ids=class_ids)
-    return _fn
+# ------------------------------------------------------------------
+# Plotting
+# ------------------------------------------------------------------
 
-
-# ============================================================
-# FID / IS computation
-# ============================================================
-def compute_overall_metrics(ddpm_sample, vae_sample, test_dataset):
-    real_eval_loader = DataLoader(test_dataset, batch_size=FID_IS_BATCH_SIZE, shuffle=True, num_workers=2)
-
-    print("Computing overall FID/IS for DDPM (runs the full reverse diffusion loop -- can be slow)...")
-    ddpm_fid, ddpm_is_mean, ddpm_is_std = compute_fid_and_is(
-        ddpm_sample, real_eval_loader, num_samples=N_SAMPLES_OVERALL, device=DEVICE, batch_size=FID_IS_BATCH_SIZE,
-    )
-    print(f"DDPM overall: FID={ddpm_fid:.3f} | IS={ddpm_is_mean:.3f} +/- {ddpm_is_std:.3f}")
-
-    print("Computing overall FID/IS for VAE...")
-    vae_fid, vae_is_mean, vae_is_std = compute_fid_and_is(
-        vae_sample, real_eval_loader, num_samples=N_SAMPLES_OVERALL, device=DEVICE, batch_size=FID_IS_BATCH_SIZE,
-    )
-    print(f"VAE overall:  FID={vae_fid:.3f} | IS={vae_is_mean:.3f} +/- {vae_is_std:.3f}")
-
-    return {
-        "DDPM": {"fid": ddpm_fid, "is_mean": ddpm_is_mean, "is_std": ddpm_is_std},
-        "VAE": {"fid": vae_fid, "is_mean": vae_is_mean, "is_std": vae_is_std},
-    }
-
-
-def compute_per_class_metrics(ddpm_sample, vae_sample, test_dataset, test_indices_by_class, num_classes):
-    if N_SAMPLES_PER_CLASS < 200:
-        print(
-            f"WARNING: N_SAMPLES_PER_CLASS={N_SAMPLES_PER_CLASS} is quite small -- FID estimates "
-            f"get noisy/biased below a few hundred samples. Treat per-class numbers as directional, "
-            f"not precise, unless you raise this."
-        )
-
-    results = []
-    for model_name, sample_fn in [("DDPM", ddpm_sample), ("VAE", vae_sample)]:
-        for class_id in range(num_classes):
-            real_subset = Subset(test_dataset, test_indices_by_class[class_id])
-            real_loader = DataLoader(real_subset, batch_size=min(FID_IS_BATCH_SIZE, len(real_subset)), shuffle=True)
-
-            class_sample_fn = make_class_conditional_sample_fn(sample_fn, class_id)
-            fid_value, is_mean, is_std = compute_fid_and_is(
-                class_sample_fn, real_loader, num_samples=N_SAMPLES_PER_CLASS, device=DEVICE,
-                batch_size=min(FID_IS_BATCH_SIZE, N_SAMPLES_PER_CLASS),
-            )
-
-            results.append({
-                "model": model_name, "class": class_id, "class_name": CIFAR10_CLASS_NAMES[class_id],
-                "fid": fid_value, "is_mean": is_mean, "is_std": is_std,
-            })
-            print(f"[{model_name}] {CIFAR10_CLASS_NAMES[class_id]:>10s}: FID={fid_value:.3f} | IS={is_mean:.3f} +/- {is_std:.3f}")
-
-    return pd.DataFrame(results)
-
-
-# ============================================================
-# Plotting -- every figure is saved to OUTPUT_DIR as a PNG
-# ============================================================
-def plot_per_class_metrics(per_class_df, num_classes):
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-
-    x = np.arange(num_classes)
-    width = 0.35
-
-    ddpm_fid = per_class_df[per_class_df["model"] == "DDPM"].sort_values("class")["fid"].values
-    vae_fid = per_class_df[per_class_df["model"] == "VAE"].sort_values("class")["fid"].values
-
-    axes[0].bar(x - width / 2, ddpm_fid, width, label="DDPM")
-    axes[0].bar(x + width / 2, vae_fid, width, label="VAE")
-    axes[0].set_xticks(x)
-    axes[0].set_xticklabels(CIFAR10_CLASS_NAMES, rotation=45, ha="right")
-    axes[0].set_ylabel("FID (lower is better)")
-    axes[0].set_title("Per-class FID")
-    axes[0].legend()
-
-    ddpm_is_mean = per_class_df[per_class_df["model"] == "DDPM"].sort_values("class")["is_mean"].values
-    ddpm_is_std = per_class_df[per_class_df["model"] == "DDPM"].sort_values("class")["is_std"].values
-    vae_is_mean = per_class_df[per_class_df["model"] == "VAE"].sort_values("class")["is_mean"].values
-    vae_is_std = per_class_df[per_class_df["model"] == "VAE"].sort_values("class")["is_std"].values
-
-    axes[1].bar(x - width / 2, ddpm_is_mean, width, yerr=ddpm_is_std, capsize=3, label="DDPM")
-    axes[1].bar(x + width / 2, vae_is_mean, width, yerr=vae_is_std, capsize=3, label="VAE")
-    axes[1].set_xticks(x)
-    axes[1].set_xticklabels(CIFAR10_CLASS_NAMES, rotation=45, ha="right")
-    axes[1].set_ylabel("Inception Score (higher is better)")
-    axes[1].set_title("Per-class Inception Score")
-    axes[1].legend()
-
-    plt.tight_layout()
-    save_path = os.path.join(OUTPUT_DIR, "per_class_metrics.png")
-    plt.savefig(save_path, dpi=150)
-    print(f"Saved -> {save_path}")
-    plt.show()
-    plt.close(fig)
-
-
-def plot_overall_metrics(overall_results):
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+def plot_overall_metrics(ddpm_fid, ddpm_is, vae_fid, vae_is, output_dir):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
 
     models = ["DDPM", "VAE"]
-    fid_values = [overall_results[m]["fid"] for m in models]
-    is_means = [overall_results[m]["is_mean"] for m in models]
-    is_stds = [overall_results[m]["is_std"] for m in models]
+    fids = [ddpm_fid, vae_fid]
+    axes[0].bar(models, fids, color=["#4C72B0", "#DD8452"])
+    axes[0].set_title("Overall FID (lower is better)")
+    axes[0].set_ylabel("FID")
+    for i, v in enumerate(fids):
+        axes[0].text(i, v, f"{v:.2f}", ha="center", va="bottom")
 
-    axes[0].bar(models, fid_values, color=["tab:blue", "tab:orange"])
-    axes[0].set_ylabel("FID (lower is better)")
-    axes[0].set_title(f"Overall FID (N={N_SAMPLES_OVERALL})")
+    is_means = [ddpm_is[0], vae_is[0]]
+    is_stds = [ddpm_is[1], vae_is[1]]
+    axes[1].bar(models, is_means, yerr=is_stds, capsize=6, color=["#4C72B0", "#DD8452"])
+    axes[1].set_title("Overall Inception Score (higher is better)")
+    axes[1].set_ylabel("IS")
+    for i, v in enumerate(is_means):
+        axes[1].text(i, v, f"{v:.2f}", ha="center", va="bottom")
 
-    axes[1].bar(models, is_means, yerr=is_stds, capsize=5, color=["tab:blue", "tab:orange"])
-    axes[1].set_ylabel("Inception Score (higher is better)")
-    axes[1].set_title(f"Overall Inception Score (N={N_SAMPLES_OVERALL})")
-
-    plt.tight_layout()
-    save_path = os.path.join(OUTPUT_DIR, "overall_metrics.png")
-    plt.savefig(save_path, dpi=150)
-    print(f"Saved -> {save_path}")
+    fig.tight_layout()
+    path = os.path.join(output_dir, "overall_metrics.png")
+    fig.savefig(path, dpi=150)
     plt.show()
     plt.close(fig)
+    print(f"Saved -> {path}")
 
-    print(pd.DataFrame(overall_results).T)
+
+def plot_per_class_metric(ddpm_values, vae_values, ylabel, title, filename, output_dir, yerr_ddpm=None, yerr_vae=None):
+    x = np.arange(NUM_CLASSES)
+    width = 0.38
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    ax.bar(x - width / 2, ddpm_values, width, yerr=yerr_ddpm, capsize=4, label="DDPM", color="#4C72B0")
+    ax.bar(x + width / 2, vae_values, width, yerr=yerr_vae, capsize=4, label="VAE", color="#DD8452")
+    ax.set_xticks(x)
+    ax.set_xticklabels(CIFAR10_CLASS_NAMES, rotation=45, ha="right")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+
+    path = os.path.join(output_dir, filename)
+    fig.savefig(path, dpi=150)
+    plt.show()
+    plt.close(fig)
+    print(f"Saved -> {path}")
 
 
-# ============================================================
-# Nearest-neighbor check: DDPM samples vs. real CIFAR-10
-#
-# Searches the full CIFAR-10 *training* set (what the model actually learned
-# from) using simple pixel-space L2 distance. This is a coarse similarity
-# metric -- it won't catch semantic similarity the way a learned feature space
-# would -- but it directly answers the practical question: is the model
-# reproducing something close to a specific training image, or generating
-# something genuinely new?
-# ============================================================
-def run_nearest_neighbor_check(ddpm_sample, train_dataset, num_classes):
-    gen_class_ids = torch.randint(0, num_classes, (NUM_GENERATED_FOR_NN,), device=DEVICE)
-    generated_images = ddpm_sample(NUM_GENERATED_FOR_NN, class_ids=gen_class_ids)
-    generated_images_01 = denormalize(generated_images).cpu()
+def plot_nn_grid(gen_images, neighbor_images, neighbor_sims, output_dir):
+    """gen_images: list of 10 (3,32,32) tensors in [-1,1].
+    neighbor_images: list of 10 tensors (5,3,32,32) in [-1,1].
+    neighbor_sims: list of 10 arrays of length 5 (cosine similarities)."""
+    n_cols = 6  # generated + top-5
+    fig, axes = plt.subplots(NUM_CLASSES, n_cols, figsize=(n_cols * 1.6, NUM_CLASSES * 1.7))
 
-    print(
-        f"Generated {NUM_GENERATED_FOR_NN} DDPM images for classes: "
-        f"{[CIFAR10_CLASS_NAMES[c] for c in gen_class_ids.cpu().tolist()]}"
-    )
+    def to_disp(img):
+        img = (img.clamp(-1, 1) + 1.0) / 2.0
+        return img.permute(1, 2, 0).numpy()
 
-    real_bank_loader = DataLoader(train_dataset, batch_size=1000, shuffle=False, num_workers=2)
-
-    real_images_01_chunks = []
-    real_labels_chunks = []
-    for imgs, labels in real_bank_loader:
-        real_images_01_chunks.append(denormalize(imgs))
-        real_labels_chunks.append(labels)
-
-    real_images_01 = torch.cat(real_images_01_chunks, dim=0)
-    real_labels = torch.cat(real_labels_chunks, dim=0)
-    print(f"Real image search bank: {real_images_01.shape[0]} training images")
-
-    gen_flat = generated_images_01.view(NUM_GENERATED_FOR_NN, -1)
-    real_flat = real_images_01.view(real_images_01.shape[0], -1)
-
-    # Chunked distance computation so peak memory stays bounded regardless of bank size.
-    chunk_size = 5000
-    all_distances = torch.empty(NUM_GENERATED_FOR_NN, real_flat.shape[0])
-    for start in range(0, real_flat.shape[0], chunk_size):
-        end = min(start + chunk_size, real_flat.shape[0])
-        all_distances[:, start:end] = torch.cdist(gen_flat, real_flat[start:end])
-
-    neighbor_distances, neighbor_indices = torch.topk(all_distances, k=NUM_NEIGHBORS, largest=False, dim=1)
-
-    fig, axes = plt.subplots(
-        NUM_GENERATED_FOR_NN, NUM_NEIGHBORS + 1,
-        figsize=(2.2 * (NUM_NEIGHBORS + 1), 2.2 * NUM_GENERATED_FOR_NN),
-    )
-
-    for row in range(NUM_GENERATED_FOR_NN):
-        ax = axes[row, 0]
-        ax.imshow(generated_images_01[row].permute(1, 2, 0).numpy())
-        ax.set_title(f"Generated\n({CIFAR10_CLASS_NAMES[gen_class_ids[row].item()]})", fontsize=9)
-        ax.axis("off")
-
-        for col in range(NUM_NEIGHBORS):
-            real_idx = neighbor_indices[row, col].item()
-            dist = neighbor_distances[row, col].item()
-            real_label = CIFAR10_CLASS_NAMES[real_labels[real_idx].item()]
-
+    for row in range(NUM_CLASSES):
+        axes[row, 0].imshow(to_disp(gen_images[row]))
+        axes[row, 0].set_ylabel(CIFAR10_CLASS_NAMES[row], fontsize=9)
+        if row == 0:
+            axes[row, 0].set_title("DDPM sample", fontsize=9)
+        for col in range(5):
             ax = axes[row, col + 1]
-            ax.imshow(real_images_01[real_idx].permute(1, 2, 0).numpy())
-            ax.set_title(f"#{col + 1}: {real_label}\nd={dist:.2f}", fontsize=8)
-            ax.axis("off")
+            ax.imshow(to_disp(neighbor_images[row][col]))
+            ax.set_title(f"sim={neighbor_sims[row][col]:.2f}", fontsize=8)
 
-    plt.suptitle("DDPM-generated (left) vs. 5 nearest real CIFAR-10 images (pixel-space L2)", y=1.001)
-    plt.tight_layout()
-    save_path = os.path.join(OUTPUT_DIR, "nearest_neighbors.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"Saved -> {save_path}")
+        for col in range(n_cols):
+            axes[row, col].set_xticks([])
+            axes[row, col].set_yticks([])
+
+    fig.suptitle("DDPM sample vs. top-5 nearest real CIFAR-10 images (Inception-feature cosine similarity)")
+    fig.tight_layout()
+    path = os.path.join(output_dir, "ddpm_nearest_neighbors.png")
+    fig.savefig(path, dpi=150)
     plt.show()
     plt.close(fig)
+    print(f"Saved -> {path}")
 
 
-# ============================================================
-# Orchestration
-# ============================================================
+# ------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------
+
 def main():
+    device = DEVICE or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     torch.manual_seed(SEED)
-    random.seed(SEED)
-    np.random.seed(SEED)
 
-    print(f"Using device: {DEVICE}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Use a non-interactive backend if there's no display attached, so plt.show()
-    # never blocks or errors out in a headless run -- the PNGs saved above are
-    # what actually guarantee the graphs are visible either way.
-    if not os.environ.get("DISPLAY") and matplotlib.get_backend().lower() != "agg":
-        matplotlib.use("Agg")
+    ddpm_dir = os.path.abspath(DDPM_DIR)
+    vae_dir = os.path.abspath(VAE_DIR)
+    ddpm_config_path = DDPM_CONFIG_PATH or os.path.join(ddpm_dir, "configs.yml")
+    vae_config_path = VAE_CONFIG_PATH or os.path.join(vae_dir, "configs.yml")
 
-    train_dataset, test_dataset, train_indices_by_class, test_indices_by_class, num_classes = load_data()
+    with open(ddpm_config_path, "r") as f:
+        ddpm_cfg = yaml.safe_load(f)
+    with open(vae_config_path, "r") as f:
+        vae_cfg = yaml.safe_load(f)
 
-    ddpm_model, diffusion, image_size = load_ddpm()
-    vae_model, vae_latent_channels, vae_latent_spatial = load_vae(expected_image_size=image_size)
+    # ---- Dynamically import each project's modules ----
+    ddpm_model_mod = _load_module("ddpm_ConditionalDDPM", os.path.join(ddpm_dir, "ConditionalDDPM.py"))
+    diffusion_mod = _load_module("ddpm_diffusion_utils", os.path.join(ddpm_dir, "diffusion_utils.py"))
+    vae_model_mod = _load_module("vae_ConditionalVAE", os.path.join(vae_dir, "ConditionalVAE.py"))
+    dataset_mod = _load_module("shared_cifar10_dataset", os.path.join(ddpm_dir, "cifar10_dataset.py"))
 
-    ddpm_sample = make_ddpm_sample_fn(ddpm_model, diffusion, image_size, num_classes)
-    vae_sample = make_vae_sample_fn(vae_model, vae_latent_channels, vae_latent_spatial, num_classes)
+    CIFAR10Dataset = dataset_mod.CIFAR10Dataset
 
-    overall_results = compute_overall_metrics(ddpm_sample, vae_sample, test_dataset)
-    per_class_df = compute_per_class_metrics(ddpm_sample, vae_sample, test_dataset, test_indices_by_class, num_classes)
+    # ---- Build + load DDPM ----
+    dm_cfg = ddpm_cfg["MODEL"]
+    ddpm_model = ddpm_model_mod.ConditionalDDPM(
+        num_classes=dm_cfg["NUM_CLASSES"],
+        embedding_dim=dm_cfg["CLASS_EMBEDDING_DIM"],
+        num_groups=dm_cfg["NUM_GROUPS"],
+        channels_per_level=dm_cfg["CHANNELS_PER_LEVEL"],
+        theta=dm_cfg["THETA"],
+    ).to(device)
 
-    plot_per_class_metrics(per_class_df, num_classes)
-    plot_overall_metrics(overall_results)
+    ddpm_ckpt_dir = _resolve_relative(ddpm_dir, ddpm_cfg["TRAINING"]["CHECKPOINT_DIR"])
+    ddpm_ckpt_path = DDPM_CKPT_PATH or _find_latest_checkpoint(ddpm_ckpt_dir, "ddpm_epoch_")
+    print(f"Loading DDPM checkpoint: {ddpm_ckpt_path}")
+    ddpm_ckpt = torch.load(ddpm_ckpt_path, map_location=device)
+    ddpm_model.load_state_dict(ddpm_ckpt["model_state_dict"])
+    ddpm_model.eval()
 
-    run_nearest_neighbor_check(ddpm_sample, train_dataset, num_classes)
+    diffusion = diffusion_mod.GaussianDiffusion(
+        timesteps=ddpm_cfg["DIFFUSION"]["TIMESTEPS"],
+        beta_start=ddpm_cfg["DIFFUSION"]["BETA_START"],
+        beta_end=ddpm_cfg["DIFFUSION"]["BETA_END"],
+        schedule=ddpm_cfg["DIFFUSION"]["BETA_SCHEDULE"],
+        device=device,
+    )
 
-    print("\n--- Caveats ---")
-    print("- FID/IS at small N: raise N_SAMPLES_OVERALL / N_SAMPLES_PER_CLASS for numbers you'd")
-    print("  trust in a report; the defaults here favor a fast run over precision.")
-    print("- Per-class FID reference size: the CIFAR-10 test split only has 1000 images per class,")
-    print("  a smaller, noisier real-image reference than the overall FID (full 10k test set).")
-    print("- DDPM sampling is slow: every generated image runs a full reverse diffusion loop.")
-    print("- Nearest-neighbor distance is pixel-space L2, not a learned similarity metric -- a")
-    print("  blunt but interpretable memorization check, not proof either way.")
+    # ---- Build + load VAE ----
+    vm_cfg = vae_cfg["MODEL"]
+    vae_model = vae_model_mod.ConditionalVAE(
+        num_classes=vm_cfg["NUM_CLASSES"],
+        embedding_dim=vm_cfg["CLASS_EMBEDDING_DIM"],
+        num_groups=vm_cfg["NUM_GROUPS"],
+        channels_per_level=vm_cfg["CHANNELS_PER_LEVEL"],
+        latent_channels=vm_cfg["LATENT_CHANNELS"],
+    ).to(device)
+
+    vae_ckpt_dir = _resolve_relative(vae_dir, vae_cfg["TRAINING"]["CHECKPOINT_DIR"])
+    vae_ckpt_path = VAE_CKPT_PATH or _find_latest_checkpoint(vae_ckpt_dir, "vae_epoch_")
+    print(f"Loading VAE checkpoint: {vae_ckpt_path}")
+    vae_ckpt = torch.load(vae_ckpt_path, map_location=device)
+    vae_model.load_state_dict(vae_ckpt["model_state_dict"])
+    vae_model.eval()
+
+    vae_latent_channels = vm_cfg["LATENT_CHANNELS"]
+    vae_latent_spatial = vm_cfg["IMAGE_SIDE_LENGTH"] // 8
+
+    # ---- Sample counts ----
+    n_total = (N_SAMPLES // NUM_CLASSES) * NUM_CLASSES
+    per_class = n_total // NUM_CLASSES
+    if n_total != N_SAMPLES:
+        print(f"Rounding N_SAMPLES {N_SAMPLES} down to {n_total} ({per_class}/class).")
+
+    # ---- Generation helpers ----
+    image_size = dm_cfg["IMAGE_SIDE_LENGTH"]
+
+    @torch.no_grad()
+    def ddpm_generate(class_id, n):
+        out = []
+        remaining = n
+        while remaining > 0:
+            b = min(GEN_BATCH_SIZE, remaining)
+            class_ids = torch.full((b,), class_id, dtype=torch.long, device=device)
+            samples = diffusion.p_sample_loop(ddpm_model, (b, 3, image_size, image_size), class_ids, device)
+            out.append(samples.cpu())
+            remaining -= b
+        return torch.cat(out, dim=0)
+
+    @torch.no_grad()
+    def vae_generate(class_id, n):
+        out = []
+        remaining = n
+        vae_model.eval()
+        while remaining > 0:
+            b = min(max(GEN_BATCH_SIZE, 200), remaining)
+            z = torch.randn(b, vae_latent_channels, vae_latent_spatial, vae_latent_spatial, device=device)
+            class_ids = torch.full((b,), class_id, dtype=torch.long, device=device)
+            samples = vae_model.decode(z, class_ids).clamp(-1.0, 1.0)
+            out.append(samples.cpu())
+            remaining -= b
+        return torch.cat(out, dim=0)
+
+    # ---- Generate per-class samples for both models ----
+    print(f"Generating {per_class} samples/class ({n_total} total) from each model...")
+    ddpm_samples_by_class = {}
+    vae_samples_by_class = {}
+    for c in range(NUM_CLASSES):
+        t0 = time.time()
+        ddpm_samples_by_class[c] = ddpm_generate(c, per_class)
+        vae_samples_by_class[c] = vae_generate(c, per_class)
+        print(f"  class {c} ({CIFAR10_CLASS_NAMES[c]}): done in {time.time() - t0:.1f}s")
+
+    ddpm_all = torch.cat([ddpm_samples_by_class[c] for c in range(NUM_CLASSES)], dim=0)
+    vae_all = torch.cat([vae_samples_by_class[c] for c in range(NUM_CLASSES)], dim=0)
+
+    # ---- Real reference images (test split), bucketed by class ----
+    real_data_dir = REAL_DATA_DIR or ddpm_cfg["DATA"]["DATA_DIR"]
+    real_test_dataset = CIFAR10Dataset(
+        root=real_data_dir, train=False, image_side_length=image_size, augment=False, download=DOWNLOAD,
+    )
+    real_loader = DataLoader(real_test_dataset, batch_size=500, shuffle=False, num_workers=2)
+
+    real_by_class = {c: [] for c in range(NUM_CLASSES)}
+    for imgs, labels in real_loader:
+        for img, lbl in zip(imgs, labels):
+            c = int(lbl.item())
+            if len(real_by_class[c]) < MAX_REAL_PER_CLASS:
+                real_by_class[c].append(img)
+    real_by_class = {c: torch.stack(v, dim=0) for c, v in real_by_class.items()}
+    real_all = torch.cat([real_by_class[c] for c in range(NUM_CLASSES)], dim=0)
+    print(f"Loaded {real_all.shape[0]} real test images ({[real_by_class[c].shape[0] for c in range(NUM_CLASSES)]} per class).")
+
+    # ---- Overall FID / IS ----
+    print("Computing overall FID/IS for DDPM...")
+    ddpm_fid, ddpm_is_mean, ddpm_is_std = compute_fid_and_is(real_all, ddpm_all, device)
+    print(f"  DDPM overall: FID={ddpm_fid:.3f} | IS={ddpm_is_mean:.3f} +/- {ddpm_is_std:.3f}")
+
+    print("Computing overall FID/IS for VAE...")
+    vae_fid, vae_is_mean, vae_is_std = compute_fid_and_is(real_all, vae_all, device)
+    print(f"  VAE overall: FID={vae_fid:.3f} | IS={vae_is_mean:.3f} +/- {vae_is_std:.3f}")
+
+    # ---- Per-class FID / IS ----
+    ddpm_fid_pc, ddpm_is_mean_pc, ddpm_is_std_pc = [], [], []
+    vae_fid_pc, vae_is_mean_pc, vae_is_std_pc = [], [], []
+    print("Computing per-class FID/IS (this repeats the metric computation 10x per model)...")
+    for c in range(NUM_CLASSES):
+        f, m, s = compute_fid_and_is(real_by_class[c], ddpm_samples_by_class[c], device)
+        ddpm_fid_pc.append(f); ddpm_is_mean_pc.append(m); ddpm_is_std_pc.append(s)
+
+        f, m, s = compute_fid_and_is(real_by_class[c], vae_samples_by_class[c], device)
+        vae_fid_pc.append(f); vae_is_mean_pc.append(m); vae_is_std_pc.append(s)
+        print(f"  class {c} ({CIFAR10_CLASS_NAMES[c]}): "
+              f"DDPM FID={ddpm_fid_pc[-1]:.2f} IS={ddpm_is_mean_pc[-1]:.2f} | "
+              f"VAE FID={vae_fid_pc[-1]:.2f} IS={vae_is_mean_pc[-1]:.2f}")
+
+    # ---- Plots ----
+    plot_overall_metrics(ddpm_fid, (ddpm_is_mean, ddpm_is_std), vae_fid, (vae_is_mean, vae_is_std), OUTPUT_DIR)
+    plot_per_class_metric(ddpm_fid_pc, vae_fid_pc, "FID", "Per-class FID (lower is better)",
+                           "per_class_fid.png", OUTPUT_DIR)
+    plot_per_class_metric(ddpm_is_mean_pc, vae_is_mean_pc, "Inception Score", "Per-class Inception Score (higher is better)",
+                           "per_class_is.png", OUTPUT_DIR,
+                           yerr_ddpm=ddpm_is_std_pc, yerr_vae=vae_is_std_pc)
+
+    # ---- DDPM nearest-neighbor lookup ----
+    print("Building Inception embedder for nearest-neighbor lookup...")
+    embedder = InceptionEmbedder(device)
+
+    real_train_dataset = CIFAR10Dataset(
+        root=real_data_dir, train=True, image_side_length=image_size, augment=False, download=DOWNLOAD,
+    )
+    train_loader = DataLoader(real_train_dataset, batch_size=500, shuffle=False, num_workers=2)
+    train_pool_by_class = {c: [] for c in range(NUM_CLASSES)}
+    for imgs, labels in train_loader:
+        for img, lbl in zip(imgs, labels):
+            c = int(lbl.item())
+            if len(train_pool_by_class[c]) < NN_POOL_PER_CLASS:
+                train_pool_by_class[c].append(img)
+        if all(len(v) >= NN_POOL_PER_CLASS for v in train_pool_by_class.values()):
+            break
+    train_pool_by_class = {c: torch.stack(v, dim=0) for c, v in train_pool_by_class.items()}
+
+    gen_representative = [ddpm_samples_by_class[c][0] for c in range(NUM_CLASSES)]
+    gen_embeds = embedder.embed(torch.stack(gen_representative, dim=0))  # (10, 2048)
+
+    nn_images, nn_sims = [], []
+    print("Searching for top-5 nearest real images per class...")
+    for c in range(NUM_CLASSES):
+        pool = train_pool_by_class[c]
+        pool_embeds = embedder.embed(pool)  # (pool_size, 2048)
+
+        g = F.normalize(gen_embeds[c:c + 1], dim=1)
+        p = F.normalize(pool_embeds, dim=1)
+        sims = (g @ p.T).squeeze(0)  # (pool_size,)
+
+        top5 = torch.topk(sims, k=5)
+        nn_images.append(pool[top5.indices])
+        nn_sims.append(top5.values.numpy())
+
+    plot_nn_grid(gen_representative, nn_images, nn_sims, OUTPUT_DIR)
+
+    # ---- Brief conclusion ----
+    print("\n" + "=" * 70)
+    print("CONCLUSION")
+    print("=" * 70)
+    fid_winner = "DDPM" if ddpm_fid < vae_fid else "VAE"
+    is_winner = "DDPM" if ddpm_is_mean > vae_is_mean else "VAE"
+    worst_ddpm_class = CIFAR10_CLASS_NAMES[int(np.argmax(ddpm_fid_pc))]
+    worst_vae_class = CIFAR10_CLASS_NAMES[int(np.argmax(vae_fid_pc))]
+
+    print(
+        f"Overall, {fid_winner} produces more realistic samples by FID "
+        f"(DDPM={ddpm_fid:.2f} vs VAE={vae_fid:.2f}, lower is better), while "
+        f"{is_winner} scores higher on Inception Score "
+        f"(DDPM={ddpm_is_mean:.2f}+/-{ddpm_is_std:.2f} vs VAE={vae_is_mean:.2f}+/-{vae_is_std:.2f}, "
+        f"higher is better -- more confident/diverse class predictions). "
+        f"Per-class FID shows the DDPM struggles most with '{worst_ddpm_class}' and the VAE with "
+        f"'{worst_vae_class}', suggesting those categories are harder for each architecture to model. "
+        f"Note these scores are computed on only {per_class} generated images per class, so per-class "
+        f"FID/IS in particular should be read as a rough, somewhat noisy signal rather than a precise "
+        f"estimate -- increase N_SAMPLES at the top of the script for a tighter comparison if you have "
+        f"the compute budget."
+    )
+
+    print(f"\nAll figures saved to: {os.path.abspath(OUTPUT_DIR)}")
 
 
 if __name__ == "__main__":
