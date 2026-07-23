@@ -63,7 +63,7 @@ finally, here are some visuals showing how both models perform
 
 *Figure 2. Per-class FID Score (lower is better).*
 
-![Per-Class IS](assets/per_class_id.png)
+![Per-Class IS](assets/per_class_is.png)
 
 *Figure 3. Per-class FID Score (lower is better).*
 
