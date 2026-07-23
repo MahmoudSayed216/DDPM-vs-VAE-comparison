@@ -46,8 +46,8 @@ CIFAR10_CLASS_NAMES = [
 # ============================================================
 # CONFIG -- edit these to match your setup
 # ============================================================
-DDPM_CHECKPOINT_PATH = "./checkpoints/ddpm_epoch_070.pt"
-VAE_CHECKPOINT_PATH = "./checkpoints/vae_epoch_070.pt"
+DDPM_CHECKPOINT_PATH = "/kaggle/input/models/marwansayed2000/ddpm70i/pytorch/default/1/ddpm.pt"
+VAE_CHECKPOINT_PATH = "/kaggle/input/models/marwansayed2000/vae70i/pytorch/default/1/vae.pt"
 DATA_DIR = "/kaggle/input/datasets/pankrzysiu/cifar10-python"
 DOWNLOAD_DATA = False  # True if DATA_DIR doesn't already contain cifar-10-batches-py
 
