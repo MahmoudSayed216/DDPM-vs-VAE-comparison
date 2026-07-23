@@ -69,8 +69,8 @@ NUM_CLASSES = 10
 # Directories containing each project's files (dataset/model code, configs.yml,
 # checkpoints/). Assumed layout: <repo_root>/ddpm/ and <repo_root>/vae/, with
 # this script sitting at <repo_root>/compare_models.py.
-DDPM_DIR = "ddpm"
-VAE_DIR = "vae"
+DDPM_DIR = "./"
+VAE_DIR = "./"
 
 # Path to each configs.yml. Set to None to default to "<DDPM_DIR>/configs.yml"
 # and "<VAE_DIR>/configs.yml".
