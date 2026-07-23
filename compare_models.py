@@ -113,7 +113,7 @@ NN_POOL_PER_CLASS = 1000
 OUTPUT_DIR = "comparison_outputs"
 
 # Random seed, for reproducible sample generation.
-SEED = 46
+SEED = 50
 
 # "cuda", "cpu", or None to auto-detect (cuda if available, else cpu).
 DEVICE = "cuda"
