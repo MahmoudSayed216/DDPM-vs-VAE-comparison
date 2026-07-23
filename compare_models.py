@@ -95,7 +95,7 @@ DOWNLOAD = False
 # Total number of samples to generate PER MODEL (rounded down to a multiple
 # of 10 so every class gets an equal share). Raise this for tighter FID/IS
 # estimates if you have the compute budget.
-N_SAMPLES = 500
+N_SAMPLES = 5000
 
 # Batch size used during sample generation (mainly matters for the DDPM,
 # since each batch runs the full reverse-diffusion loop).
@@ -103,7 +103,7 @@ GEN_BATCH_SIZE = 64
 
 # Cap on real test images used per class as the FID/IS reference (the test
 # split only has ~1000/class, so this rarely needs to change).
-MAX_REAL_PER_CLASS = 500
+MAX_REAL_PER_CLASS = 1000
 
 # How many real train-split images per class to search over for the
 # nearest-neighbor step.
